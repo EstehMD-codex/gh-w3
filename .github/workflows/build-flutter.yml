@@ -1,0 +1,54 @@
+
+name: Build Flutter
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Tipe build'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Get Dependencies
+        run: flutter pub get
+
+      - name: Build APK (${{ inputs.build_type }})
+        run: flutter build apk --${{ inputs.build_type }}
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ inputs.build_type }}
+          path: build/app/outputs/apk/${{ inputs.build_type }}/app-${{ inputs.build_type }}.apk
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+          
