@@ -1,54 +1,409 @@
-
-name: Build Flutter
+name: Build Flutter / Web2APK
 
 on:
   workflow_dispatch:
     inputs:
+      jobId:
+        description: 'ID build dari bot'
+        required: false
+        default: 'manual'
+        type: string
+
+      userId:
+        description: 'ID user dari bot'
+        required: false
+        default: '0'
+        type: string
+
+      payload:
+        description: 'Payload JSON dari bot'
+        required: false
+        default: '{}'
+        type: string
+
       build_type:
-        description: 'Tipe build'
-        required: true
+        description: 'Tipe build manual'
+        required: false
         default: 'release'
         type: choice
         options:
           - release
           - debug
 
+      source_url:
+        description: 'URL ZIP source manual'
+        required: false
+        type: string
+
 permissions:
   contents: read
 
+concurrency:
+  group: build-${{ inputs.jobId || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   build:
+    name: Build ${{ inputs.jobId || github.run_id }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout Worker
         uses: actions/checkout@v4
 
-      - name: Setup Java
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Flutter
+      - name: Parse Bot Payload
+        id: config
+        env:
+          RAW_PAYLOAD: ${{ inputs.payload }}
+          MANUAL_BUILD_TYPE: ${{ inputs.build_type }}
+          MANUAL_SOURCE_URL: ${{ inputs.source_url }}
+          INPUT_JOB_ID: ${{ inputs.jobId }}
+          INPUT_USER_ID: ${{ inputs.userId }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          printf '%s' "${RAW_PAYLOAD:-{}}" > "$RUNNER_TEMP/build-payload.json"
+
+          if ! jq -e 'type == "object"' "$RUNNER_TEMP/build-payload.json" >/dev/null; then
+            echo "::error::Payload bukan JSON object yang valid."
+            exit 1
+          fi
+
+          MODE="$(jq -r '.mode // "zip"' "$RUNNER_TEMP/build-payload.json")"
+          SOURCE_URL="$(jq -r '.url // empty' "$RUNNER_TEMP/build-payload.json")"
+          APP_NAME="$(jq -r '.appName // "Web App"' "$RUNNER_TEMP/build-payload.json")"
+          ICON_URL="$(jq -r '.iconUrl // empty' "$RUNNER_TEMP/build-payload.json")"
+          BUILD_TYPE="$(jq -r --arg fallback "${MANUAL_BUILD_TYPE:-release}" '.buildType // $fallback' "$RUNNER_TEMP/build-payload.json")"
+
+          JOB_ID="${INPUT_JOB_ID:-manual}"
+
+          if [ -z "$SOURCE_URL" ]; then
+            SOURCE_URL="${MANUAL_SOURCE_URL:-}"
+          fi
+
+          if [ "$BUILD_TYPE" != "release" ] && [ "$BUILD_TYPE" != "debug" ]; then
+            echo "::error::buildType harus release atau debug."
+            exit 1
+          fi
+
+          if [ "$MODE" != "zip" ] && [ "$MODE" != "url" ]; then
+            echo "::error::Mode tidak dikenal: $MODE"
+            exit 1
+          fi
+
+          if [ -z "$SOURCE_URL" ]; then
+            echo "::error::URL source kosong."
+            exit 1
+          fi
+
+          if [[ ! "$SOURCE_URL" =~ ^https?:// ]]; then
+            echo "::error::URL source tidak valid."
+            exit 1
+          fi
+
+          SAFE_JOB_ID="$(printf '%s' "$JOB_ID" | tr -cd 'A-Za-z0-9._-' | cut -c1-100)"
+          [ -n "$SAFE_JOB_ID" ] || SAFE_JOB_ID="run-${GITHUB_RUN_ID}"
+
+          {
+            echo "MODE=$MODE"
+            echo "SOURCE_URL=$SOURCE_URL"
+            echo "ICON_URL=$ICON_URL"
+            echo "APP_NAME=$APP_NAME"
+            echo "BUILD_TYPE=$BUILD_TYPE"
+            echo "SAFE_JOB_ID=$SAFE_JOB_ID"
+          } >> "$GITHUB_ENV"
+
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "build_type=$BUILD_TYPE" >> "$GITHUB_OUTPUT"
+          echo "job_id=$SAFE_JOB_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Download ZIP Source
+        if: steps.config.outputs.mode == 'zip'
+        env:
+          SOURCE_URL: ${{ env.SOURCE_URL }}
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          TOKEN="${PAT_TOKEN:-$GH_TOKEN}"
+
+          curl --fail --location --retry 3 --retry-delay 3 \
+            --header "Authorization: Bearer $TOKEN" \
+            --header "Accept: application/octet-stream" \
+            "$SOURCE_URL" \
+            --output "$RUNNER_TEMP/source.zip"
+
+          if ! unzip -tq "$RUNNER_TEMP/source.zip" >/dev/null; then
+            echo "::error::File yang diunduh bukan ZIP valid."
+            exit 1
+          fi
+
+      - name: Extract and Locate Flutter Project
+        if: steps.config.outputs.mode == 'zip'
+        id: flutter-project
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/source"
+          unzip -q "$RUNNER_TEMP/source.zip" -d "$RUNNER_TEMP/source"
+
+          PUBSPEC="$(find "$RUNNER_TEMP/source" \
+            -type f -name pubspec.yaml \
+            -not -path '*/.dart_tool/*' \
+            -print -quit)"
+
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::pubspec.yaml tidak ditemukan."
+            find "$RUNNER_TEMP/source" -maxdepth 4 -type f | head -100
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$PUBSPEC")"
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Flutter Stable
+        if: steps.config.outputs.mode == 'zip'
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
-      - name: Get Dependencies
+      - name: Flutter Doctor
+        if: steps.config.outputs.mode == 'zip'
+        run: flutter doctor -v
+
+      - name: Get Flutter Dependencies
+        if: steps.config.outputs.mode == 'zip'
+        working-directory: ${{ steps.flutter-project.outputs.project_dir }}
         run: flutter pub get
 
-      - name: Build APK (${{ inputs.build_type }})
-        run: flutter build apk --${{ inputs.build_type }}
+      - name: Build Flutter APK
+        if: steps.config.outputs.mode == 'zip'
+        working-directory: ${{ steps.flutter-project.outputs.project_dir }}
+        run: |
+          set -euo pipefail
 
-      - name: Upload APK
+          flutter build apk --${{ env.BUILD_TYPE }}
+
+          APK_PATH="build/app/outputs/flutter-apk/app-${{ env.BUILD_TYPE }}.apk"
+
+          if [ ! -s "$APK_PATH" ]; then
+            echo "::error::APK tidak ditemukan."
+            find build/app/outputs -type f 2>/dev/null | head -100
+            exit 1
+          fi
+
+          echo "APK_PATH=$PWD/$APK_PATH" >> "$GITHUB_ENV"
+
+      - name: Download Web2APK Icon
+        if: steps.config.outputs.mode == 'url' && env.ICON_URL != ''
+        env:
+          ICON_URL: ${{ env.ICON_URL }}
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          TOKEN="${PAT_TOKEN:-$GH_TOKEN}"
+
+          curl --fail --location --retry 3 \
+            --header "Authorization: Bearer $TOKEN" \
+            --header "Accept: application/octet-stream" \
+            "$ICON_URL" \
+            --output "$RUNNER_TEMP/web-icon.png"
+
+      - name: Generate Web2APK Android Project
+        if: steps.config.outputs.mode == 'url'
+        env:
+          SOURCE_URL: ${{ env.SOURCE_URL }}
+          APP_NAME: ${{ env.APP_NAME }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/web2apk/app/src/main/java/com/generated/webapk"
+          mkdir -p "$RUNNER_TEMP/web2apk/app/src/main/res/values"
+
+          cat > "$RUNNER_TEMP/web2apk/settings.gradle" <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "Web2APK"
+          include(":app")
+          EOF
+
+          cat > "$RUNNER_TEMP/web2apk/build.gradle" <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          EOF
+
+          cat > "$RUNNER_TEMP/web2apk/gradle.properties" <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx3g
+          EOF
+
+          cat > "$RUNNER_TEMP/web2apk/app/build.gradle" <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.generated.webapk'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.generated.webapk'
+                  minSdk 23
+                  targetSdk 35
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+                  debug {
+                      debuggable true
+                  }
+              }
+          }
+          EOF
+
+          python3 - <<'PY'
+          import os, html
+
+          name = os.environ.get("APP_NAME", "Web App")
+          url = os.environ["SOURCE_URL"]
+
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "web2apk/app/src/main/res/values/strings.xml"), "w") as f:
+              f.write("<resources>")
+              f.write("<string name='app_name'>" + html.escape(name) + "</string>")
+              f.write("<string name='start_url'>" + html.escape(url) + "</string>")
+              f.write("</resources>")
+          PY
+
+          cat > "$RUNNER_TEMP/web2apk/app/src/main/AndroidManifest.xml" <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+
+              <application
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > "$RUNNER_TEMP/web2apk/app/src/main/java/com/generated/webapk/MainActivity.java" <<'EOF'
+          package com.generated.webapk;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+
+          public class MainActivity extends Activity {
+              private WebView webView;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  webView = new WebView(this);
+                  setContentView(webView);
+
+                  WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+
+                  webView.setWebViewClient(new WebViewClient());
+                  webView.setWebChromeClient(new WebChromeClient());
+
+                  webView.loadUrl(getString(R.string.start_url));
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (webView.canGoBack()) {
+                      webView.goBack();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+          }
+          EOF
+
+      - name: Setup Android SDK
+        if: steps.config.outputs.mode == 'url'
+        uses: android-actions/setup-android@v3
+
+      - name: Build Web2APK
+        if: steps.config.outputs.mode == 'url'
+        run: |
+          set -euo pipefail
+
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+          cd "$RUNNER_TEMP/web2apk"
+
+          curl -fL \
+            https://services.gradle.org/distributions/gradle-8.9-bin.zip \
+            -o "$RUNNER_TEMP/gradle.zip"
+
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
+
+          "$RUNNER_TEMP/gradle-8.9/bin/gradle" \
+            --no-daemon ":app:assemble${{ env.BUILD_TYPE == 'release' && 'Release' || 'Debug' }}"
+
+          APK_PATH="$RUNNER_TEMP/web2apk/app/build/outputs/apk/${{ env.BUILD_TYPE }}/app-${{ env.BUILD_TYPE }}.apk"
+
+          if [ ! -s "$APK_PATH" ]; then
+            echo "::error::APK Web2APK tidak ditemukan."
+            exit 1
+          fi
+
+          echo "APK_PATH=$APK_PATH" >> "$GITHUB_ENV"
+
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: app-${{ inputs.build_type }}
-          path: build/app/outputs/apk/${{ inputs.build_type }}/app-${{ inputs.build_type }}.apk
+          name: apk-${{ inputs.jobId || github.run_id }}
+          path: ${{ env.APK_PATH }}
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
-          
