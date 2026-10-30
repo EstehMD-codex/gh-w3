@@ -1,57 +1,40 @@
-
-name: Build Flutter / Web2APK / OctaviusAgent
+name: Build Flutter / Web2APK
 
 on:
   workflow_dispatch:
     inputs:
       jobId:
         description: 'ID build dari bot'
-        required: false
-        default: 'manual'
+        required: true
         type: string
-
       userId:
         description: 'ID user dari bot'
         required: false
         default: '0'
         type: string
-
       payload:
         description: 'Payload JSON dari bot'
-        required: false
-        default: '{}'
-        type: string
-
-      build_type:
-        description: 'Tipe build manual'
-        required: false
-        default: 'release'
-        type: choice
-        options:
-          - release
-          - debug
-
-      source_url:
-        description: 'URL ZIP source atau URL website untuk build manual'
-        required: false
+        required: true
         type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: build-${{ inputs.jobId || github.run_id }}
+  group: build-${{ inputs.jobId }}
   cancel-in-progress: false
 
 jobs:
   build:
-    name: Build ${{ inputs.jobId || github.run_id }}
+    name: Build ${{ inputs.jobId }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
     steps:
-      - name: Checkout Worker
+      - name: Checkout Worker Repository
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -64,20 +47,10 @@ jobs:
         shell: bash
         env:
           RAW_PAYLOAD: ${{ inputs.payload }}
-          MANUAL_BUILD_TYPE: ${{ inputs.build_type }}
-          MANUAL_SOURCE_URL: ${{ inputs.source_url }}
-          INPUT_JOB_ID: ${{ inputs.jobId }}
-          INPUT_USER_ID: ${{ inputs.userId }}
         run: |
           set -euo pipefail
-
           PAYLOAD_FILE="$RUNNER_TEMP/build-payload.json"
-
-          if [ -z "${RAW_PAYLOAD:-}" ]; then
-            printf '%s' '{}' > "$PAYLOAD_FILE"
-          else
-            printf '%s' "$RAW_PAYLOAD" > "$PAYLOAD_FILE"
-          fi
+          printf '%s' "$RAW_PAYLOAD" > "$PAYLOAD_FILE"
 
           if ! jq -e 'type == "object"' "$PAYLOAD_FILE" >/dev/null 2>&1; then
             echo "::error::Payload bukan JSON object yang valid."
@@ -85,95 +58,43 @@ jobs:
           fi
 
           MODE="$(jq -r '.mode // "zip"' "$PAYLOAD_FILE")"
+          BUILD_TYPE="$(jq -r '.buildType // "release"' "$PAYLOAD_FILE")"
+          SOURCE_PATH="$(jq -r '.sourcePath // empty' "$PAYLOAD_FILE")"
           SOURCE_URL="$(jq -r '.url // empty' "$PAYLOAD_FILE")"
           APP_NAME="$(jq -r '.appName // "Web App"' "$PAYLOAD_FILE")"
-          ICON_URL="$(jq -r '.iconUrl // empty' "$PAYLOAD_FILE")"
 
-          BUILD_TYPE="$(jq -r \
-            --arg fallback "${MANUAL_BUILD_TYPE:-release}" \
-            '.buildType // $fallback' "$PAYLOAD_FILE")"
-
-          JOB_ID="${INPUT_JOB_ID:-manual}"
-
-          if [ -z "$SOURCE_URL" ]; then
-            SOURCE_URL="${MANUAL_SOURCE_URL:-}"
-          fi
-
-          if [ "$BUILD_TYPE" != "release" ] && [ "$BUILD_TYPE" != "debug" ]; then
+          if [[ "$BUILD_TYPE" != "release" && "$BUILD_TYPE" != "debug" ]]; then
             echo "::error::buildType harus release atau debug."
             exit 1
           fi
-
-          if [ "$MODE" != "zip" ] && [ "$MODE" != "url" ]; then
+          if [[ "$MODE" != "zip" && "$MODE" != "url" ]]; then
             echo "::error::Mode tidak dikenal: $MODE"
             exit 1
           fi
 
-          if [ -z "$SOURCE_URL" ]; then
-            echo "::error::URL source kosong."
-            echo "::error::Isi source_url untuk build manual atau kirim url melalui payload bot."
+          if [[ "$MODE" == "zip" ]]; then
+            if [[ -z "$SOURCE_PATH" || "$SOURCE_PATH" == /* || "$SOURCE_PATH" == *".."* ]]; then
+              echo "::error::sourcePath ZIP kosong atau tidak aman."
+              exit 1
+            fi
+            if [[ ! -f "$GITHUB_WORKSPACE/$SOURCE_PATH" ]]; then
+              echo "::error::ZIP base tidak ditemukan: $SOURCE_PATH"
+              find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -name '*.zip' -printf '%f\n'
+              exit 1
+            fi
+          elif [[ -z "$SOURCE_URL" ]]; then
+            echo "::error::URL website Web2APK kosong."
             exit 1
           fi
-
-          if [[ ! "$SOURCE_URL" =~ ^https?:// ]]; then
-            echo "::error::URL source tidak valid."
-            exit 1
-          fi
-
-          SAFE_JOB_ID="$(printf '%s' "$JOB_ID" | tr -cd 'A-Za-z0-9._-' | cut -c1-100)"
-          [ -n "$SAFE_JOB_ID" ] || SAFE_JOB_ID="run-${GITHUB_RUN_ID}"
 
           {
             echo "MODE=$MODE"
-            echo "SOURCE_URL=$SOURCE_URL"
-            echo "ICON_URL=$ICON_URL"
-            echo "APP_NAME=$APP_NAME"
             echo "BUILD_TYPE=$BUILD_TYPE"
-            echo "SAFE_JOB_ID=$SAFE_JOB_ID"
+            echo "SOURCE_PATH=$SOURCE_PATH"
+            echo "SOURCE_URL=$SOURCE_URL"
+            echo "APP_NAME=$APP_NAME"
           } >> "$GITHUB_ENV"
-
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-          echo "build_type=$BUILD_TYPE" >> "$GITHUB_OUTPUT"
-          echo "job_id=$SAFE_JOB_ID" >> "$GITHUB_OUTPUT"
-
-      - name: Download ZIP Source
-        if: steps.config.outputs.mode == 'zip'
-        env:
-          SOURCE_URL: ${{ env.SOURCE_URL }}
-          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          HOST="$(python3 -c 'import os,urllib.parse; print(urllib.parse.urlparse(os.environ["SOURCE_URL"]).hostname or "")')"
-
-          CURL_ARGS=(
-            --fail
-            --location
-            --retry 3
-            --retry-delay 3
-          )
-
-          if [[ "$HOST" == "github.com" || "$HOST" == "api.github.com" ]]; then
-            TOKEN="${PAT_TOKEN:-}"
-
-            if [ -z "$TOKEN" ]; then
-              echo "::error::PAT_TOKEN belum diatur di repository Secrets."
-              exit 1
-            fi
-
-            CURL_ARGS+=(--header "Authorization: Bearer $TOKEN")
-            CURL_ARGS+=(--header "Accept: application/octet-stream")
-          fi
-
-          curl "${CURL_ARGS[@]}" \
-            "$SOURCE_URL" \
-            --output "$RUNNER_TEMP/source.zip"
-
-          if ! unzip -tq "$RUNNER_TEMP/source.zip" >/dev/null; then
-            echo "::error::File yang diunduh bukan ZIP valid."
-            exit 1
-          fi
 
       - name: Extract and Locate Flutter Project
         if: steps.config.outputs.mode == 'zip'
@@ -181,25 +102,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p "$RUNNER_TEMP/source"
-          unzip -q "$RUNNER_TEMP/source.zip" -d "$RUNNER_TEMP/source"
+          unzip -tq "$GITHUB_WORKSPACE/$SOURCE_PATH"
+          unzip -q "$GITHUB_WORKSPACE/$SOURCE_PATH" -d "$RUNNER_TEMP/source"
 
-          PUBSPEC="$(find "$RUNNER_TEMP/source" \
-            -type f \
-            -name pubspec.yaml \
-            -not -path '*/.dart_tool/*' \
-            -print -quit)"
-
-          if [ -z "$PUBSPEC" ]; then
-            echo "::error::pubspec.yaml tidak ditemukan dalam ZIP."
+          PUBSPEC="$(find "$RUNNER_TEMP/source" -type f -name pubspec.yaml \
+            -not -path '*/.dart_tool/*' -print -quit)"
+          if [[ -z "$PUBSPEC" ]]; then
+            echo "::error::pubspec.yaml tidak ditemukan dalam ZIP base."
             find "$RUNNER_TEMP/source" -maxdepth 4 -type f | head -100
             exit 1
           fi
-
-          PROJECT_DIR="$(dirname "$PUBSPEC")"
-
-          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "project_dir=$(dirname "$PUBSPEC")" >> "$GITHUB_OUTPUT"
 
       - name: Setup Flutter Stable
         if: steps.config.outputs.mode == 'zip'
@@ -220,81 +134,33 @@ jobs:
       - name: Build Flutter APK
         if: steps.config.outputs.mode == 'zip'
         working-directory: ${{ steps.flutter-project.outputs.project_dir }}
-        env:
-          BUILD_TYPE: ${{ env.BUILD_TYPE }}
         shell: bash
         run: |
           set -euo pipefail
-
           flutter build apk --"$BUILD_TYPE"
-
           APK_PATH="build/app/outputs/flutter-apk/app-${BUILD_TYPE}.apk"
-
-          if [ ! -s "$APK_PATH" ]; then
+          if [[ ! -s "$APK_PATH" ]]; then
             echo "::error::APK Flutter tidak ditemukan."
             find build/app/outputs -type f 2>/dev/null | head -100
             exit 1
           fi
-
           echo "APK_PATH=$PWD/$APK_PATH" >> "$GITHUB_ENV"
-
-      - name: Download Web2APK Icon
-        if: steps.config.outputs.mode == 'url' && env.ICON_URL != ''
-        env:
-          ICON_URL: ${{ env.ICON_URL }}
-          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          HOST="$(python3 -c 'import os,urllib.parse; print(urllib.parse.urlparse(os.environ["ICON_URL"]).hostname or "")')"
-
-          CURL_ARGS=(--fail --location --retry 3)
-
-          if [[ "$HOST" == "github.com" || "$HOST" == "api.github.com" ]]; then
-            TOKEN="${PAT_TOKEN:-}"
-
-            if [ -z "$TOKEN" ]; then
-              echo "::error::PAT_TOKEN belum diatur."
-              exit 1
-            fi
-
-            CURL_ARGS+=(--header "Authorization: Bearer $TOKEN")
-            CURL_ARGS+=(--header "Accept: application/octet-stream")
-          fi
-
-          curl "${CURL_ARGS[@]}" \
-            "$ICON_URL" \
-            --output "$RUNNER_TEMP/web-icon.png"
 
       - name: Generate Web2APK Android Project
         if: steps.config.outputs.mode == 'url'
-        env:
-          SOURCE_URL: ${{ env.SOURCE_URL }}
-          APP_NAME: ${{ env.APP_NAME }}
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p "$RUNNER_TEMP/web2apk/app/src/main/java/com/generated/webapk"
           mkdir -p "$RUNNER_TEMP/web2apk/app/src/main/res/values"
 
           cat > "$RUNNER_TEMP/web2apk/settings.gradle" <<'EOF'
           pluginManagement {
-              repositories {
-                  google()
-                  mavenCentral()
-                  gradlePluginPortal()
-              }
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
           }
-
           dependencyResolutionManagement {
-              repositories {
-                  google()
-                  mavenCentral()
-              }
+              repositories { google(); mavenCentral() }
           }
-
           rootProject.name = "Web2APK"
           include(":app")
           EOF
@@ -311,14 +177,10 @@ jobs:
           EOF
 
           cat > "$RUNNER_TEMP/web2apk/app/build.gradle" <<'EOF'
-          plugins {
-              id 'com.android.application'
-          }
-
+          plugins { id 'com.android.application' }
           android {
               namespace 'com.generated.webapk'
               compileSdk 35
-
               defaultConfig {
                   applicationId 'com.generated.webapk'
                   minSdk 23
@@ -326,66 +188,36 @@ jobs:
                   versionCode 1
                   versionName '1.0'
               }
-
               buildTypes {
-                  release {
-                      minifyEnabled false
-                  }
-
-                  debug {
-                      debuggable true
-                  }
+                  release { minifyEnabled false }
+                  debug { debuggable true }
               }
           }
           EOF
 
           python3 - <<'PY'
           import os
-          import html
           import xml.etree.ElementTree as ET
-
-          name = os.environ.get("APP_NAME", "Web App")
-          url = os.environ["SOURCE_URL"]
-
           root = ET.Element("resources")
-
-          app_name = ET.SubElement(root, "string", {"name": "app_name"})
-          app_name.text = name
-
-          start_url = ET.SubElement(root, "string", {"name": "start_url"})
-          start_url.text = url
-
+          ET.SubElement(root, "string", {"name": "app_name"}).text = os.environ["APP_NAME"]
+          ET.SubElement(root, "string", {"name": "start_url"}).text = os.environ["SOURCE_URL"]
           ET.indent(root)
-
-          path = os.path.join(
-              os.environ["RUNNER_TEMP"],
-              "web2apk/app/src/main/res/values/strings.xml"
-          )
-
           ET.ElementTree(root).write(
-              path,
-              encoding="utf-8",
-              xml_declaration=True
+              os.path.join(os.environ["RUNNER_TEMP"], "web2apk/app/src/main/res/values/strings.xml"),
+              encoding="utf-8", xml_declaration=True
           )
           PY
 
           cat > "$RUNNER_TEMP/web2apk/app/src/main/AndroidManifest.xml" <<'EOF'
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET"/>
-
-              <application
-                  android:label="@string/app_name"
+              <application android:label="@string/app_name"
                   android:theme="@android:style/Theme.Material.Light.NoActionBar">
-
-                  <activity
-                      android:name=".MainActivity"
-                      android:exported="true">
-
+                  <activity android:name=".MainActivity" android:exported="true">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN"/>
                           <category android:name="android.intent.category.LAUNCHER"/>
                       </intent-filter>
-
                   </activity>
               </application>
           </manifest>
@@ -393,41 +225,28 @@ jobs:
 
           cat > "$RUNNER_TEMP/web2apk/app/src/main/java/com/generated/webapk/MainActivity.java" <<'EOF'
           package com.generated.webapk;
-
           import android.app.Activity;
           import android.os.Bundle;
           import android.webkit.WebView;
           import android.webkit.WebViewClient;
           import android.webkit.WebChromeClient;
           import android.webkit.WebSettings;
-
           public class MainActivity extends Activity {
               private WebView webView;
-
-              @Override
-              protected void onCreate(Bundle savedInstanceState) {
-                  super.onCreate(savedInstanceState);
-
+              @Override public void onCreate(Bundle state) {
+                  super.onCreate(state);
                   webView = new WebView(this);
                   setContentView(webView);
-
                   WebSettings settings = webView.getSettings();
                   settings.setJavaScriptEnabled(true);
                   settings.setDomStorageEnabled(true);
-
                   webView.setWebViewClient(new WebViewClient());
                   webView.setWebChromeClient(new WebChromeClient());
-
                   webView.loadUrl(getString(R.string.start_url));
               }
-
-              @Override
-              public void onBackPressed() {
-                  if (webView.canGoBack()) {
-                      webView.goBack();
-                  } else {
-                      super.onBackPressed();
-                  }
+              @Override public void onBackPressed() {
+                  if (webView.canGoBack()) webView.goBack();
+                  else super.onBackPressed();
               }
           }
           EOF
@@ -438,47 +257,29 @@ jobs:
 
       - name: Build Web2APK
         if: steps.config.outputs.mode == 'url'
-        env:
-          BUILD_TYPE: ${{ env.BUILD_TYPE }}
         shell: bash
         run: |
           set -euo pipefail
-
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager "platforms;android-35" "build-tools;35.0.0"
-
           cd "$RUNNER_TEMP/web2apk"
-
           curl --fail --location \
             https://services.gradle.org/distributions/gradle-8.9-bin.zip \
             --output "$RUNNER_TEMP/gradle.zip"
-
           unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
-
-          if [ "$BUILD_TYPE" = "release" ]; then
-            GRADLE_TASK="assembleRelease"
-          else
-            GRADLE_TASK="assembleDebug"
-          fi
-
-          "$RUNNER_TEMP/gradle-8.9/bin/gradle" \
-            --no-daemon \
-            ":app:$GRADLE_TASK"
-
+          if [[ "$BUILD_TYPE" == "release" ]]; then TASK="assembleRelease"; else TASK="assembleDebug"; fi
+          "$RUNNER_TEMP/gradle-8.9/bin/gradle" --no-daemon ":app:$TASK"
           APK_PATH="$RUNNER_TEMP/web2apk/app/build/outputs/apk/${BUILD_TYPE}/app-${BUILD_TYPE}.apk"
-
-          if [ ! -s "$APK_PATH" ]; then
+          if [[ ! -s "$APK_PATH" ]]; then
             echo "::error::APK Web2APK tidak ditemukan."
-            find app/build/outputs -type f 2>/dev/null | head -100
             exit 1
           fi
-
           echo "APK_PATH=$APK_PATH" >> "$GITHUB_ENV"
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: apk-${{ inputs.jobId || github.run_id }}
+          name: apk-${{ inputs.jobId }}
           path: ${{ env.APK_PATH }}
           if-no-files-found: error
           compression-level: 0
