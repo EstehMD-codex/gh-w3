@@ -1,4 +1,5 @@
-name: Build Flutter / Web2APK
+
+name: Build Flutter / Web2APK / OctaviusAgent
 
 on:
   workflow_dispatch:
@@ -31,7 +32,7 @@ on:
           - debug
 
       source_url:
-        description: 'URL ZIP source manual'
+        description: 'URL ZIP source atau URL website untuk build manual'
         required: false
         type: string
 
@@ -60,28 +61,37 @@ jobs:
 
       - name: Parse Bot Payload
         id: config
+        shell: bash
         env:
           RAW_PAYLOAD: ${{ inputs.payload }}
           MANUAL_BUILD_TYPE: ${{ inputs.build_type }}
           MANUAL_SOURCE_URL: ${{ inputs.source_url }}
           INPUT_JOB_ID: ${{ inputs.jobId }}
           INPUT_USER_ID: ${{ inputs.userId }}
-        shell: bash
         run: |
           set -euo pipefail
 
-          printf '%s' "${RAW_PAYLOAD:-{}}" > "$RUNNER_TEMP/build-payload.json"
+          PAYLOAD_FILE="$RUNNER_TEMP/build-payload.json"
 
-          if ! jq -e 'type == "object"' "$RUNNER_TEMP/build-payload.json" >/dev/null; then
+          if [ -z "${RAW_PAYLOAD:-}" ]; then
+            printf '%s' '{}' > "$PAYLOAD_FILE"
+          else
+            printf '%s' "$RAW_PAYLOAD" > "$PAYLOAD_FILE"
+          fi
+
+          if ! jq -e 'type == "object"' "$PAYLOAD_FILE" >/dev/null 2>&1; then
             echo "::error::Payload bukan JSON object yang valid."
             exit 1
           fi
 
-          MODE="$(jq -r '.mode // "zip"' "$RUNNER_TEMP/build-payload.json")"
-          SOURCE_URL="$(jq -r '.url // empty' "$RUNNER_TEMP/build-payload.json")"
-          APP_NAME="$(jq -r '.appName // "Web App"' "$RUNNER_TEMP/build-payload.json")"
-          ICON_URL="$(jq -r '.iconUrl // empty' "$RUNNER_TEMP/build-payload.json")"
-          BUILD_TYPE="$(jq -r --arg fallback "${MANUAL_BUILD_TYPE:-release}" '.buildType // $fallback' "$RUNNER_TEMP/build-payload.json")"
+          MODE="$(jq -r '.mode // "zip"' "$PAYLOAD_FILE")"
+          SOURCE_URL="$(jq -r '.url // empty' "$PAYLOAD_FILE")"
+          APP_NAME="$(jq -r '.appName // "Web App"' "$PAYLOAD_FILE")"
+          ICON_URL="$(jq -r '.iconUrl // empty' "$PAYLOAD_FILE")"
+
+          BUILD_TYPE="$(jq -r \
+            --arg fallback "${MANUAL_BUILD_TYPE:-release}" \
+            '.buildType // $fallback' "$PAYLOAD_FILE")"
 
           JOB_ID="${INPUT_JOB_ID:-manual}"
 
@@ -101,6 +111,7 @@ jobs:
 
           if [ -z "$SOURCE_URL" ]; then
             echo "::error::URL source kosong."
+            echo "::error::Isi source_url untuk build manual atau kirim url melalui payload bot."
             exit 1
           fi
 
@@ -130,15 +141,32 @@ jobs:
         env:
           SOURCE_URL: ${{ env.SOURCE_URL }}
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
-          GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          TOKEN="${PAT_TOKEN:-$GH_TOKEN}"
+          HOST="$(python3 -c 'import os,urllib.parse; print(urllib.parse.urlparse(os.environ["SOURCE_URL"]).hostname or "")')"
 
-          curl --fail --location --retry 3 --retry-delay 3 \
-            --header "Authorization: Bearer $TOKEN" \
-            --header "Accept: application/octet-stream" \
+          CURL_ARGS=(
+            --fail
+            --location
+            --retry 3
+            --retry-delay 3
+          )
+
+          if [[ "$HOST" == "github.com" || "$HOST" == "api.github.com" ]]; then
+            TOKEN="${PAT_TOKEN:-}"
+
+            if [ -z "$TOKEN" ]; then
+              echo "::error::PAT_TOKEN belum diatur di repository Secrets."
+              exit 1
+            fi
+
+            CURL_ARGS+=(--header "Authorization: Bearer $TOKEN")
+            CURL_ARGS+=(--header "Accept: application/octet-stream")
+          fi
+
+          curl "${CURL_ARGS[@]}" \
             "$SOURCE_URL" \
             --output "$RUNNER_TEMP/source.zip"
 
@@ -150,6 +178,7 @@ jobs:
       - name: Extract and Locate Flutter Project
         if: steps.config.outputs.mode == 'zip'
         id: flutter-project
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -157,17 +186,19 @@ jobs:
           unzip -q "$RUNNER_TEMP/source.zip" -d "$RUNNER_TEMP/source"
 
           PUBSPEC="$(find "$RUNNER_TEMP/source" \
-            -type f -name pubspec.yaml \
+            -type f \
+            -name pubspec.yaml \
             -not -path '*/.dart_tool/*' \
             -print -quit)"
 
           if [ -z "$PUBSPEC" ]; then
-            echo "::error::pubspec.yaml tidak ditemukan."
+            echo "::error::pubspec.yaml tidak ditemukan dalam ZIP."
             find "$RUNNER_TEMP/source" -maxdepth 4 -type f | head -100
             exit 1
           fi
 
           PROJECT_DIR="$(dirname "$PUBSPEC")"
+
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
 
       - name: Setup Flutter Stable
@@ -189,15 +220,18 @@ jobs:
       - name: Build Flutter APK
         if: steps.config.outputs.mode == 'zip'
         working-directory: ${{ steps.flutter-project.outputs.project_dir }}
+        env:
+          BUILD_TYPE: ${{ env.BUILD_TYPE }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          flutter build apk --${{ env.BUILD_TYPE }}
+          flutter build apk --"$BUILD_TYPE"
 
-          APK_PATH="build/app/outputs/flutter-apk/app-${{ env.BUILD_TYPE }}.apk"
+          APK_PATH="build/app/outputs/flutter-apk/app-${BUILD_TYPE}.apk"
 
           if [ ! -s "$APK_PATH" ]; then
-            echo "::error::APK tidak ditemukan."
+            echo "::error::APK Flutter tidak ditemukan."
             find build/app/outputs -type f 2>/dev/null | head -100
             exit 1
           fi
@@ -209,15 +243,27 @@ jobs:
         env:
           ICON_URL: ${{ env.ICON_URL }}
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
-          GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           set -euo pipefail
 
-          TOKEN="${PAT_TOKEN:-$GH_TOKEN}"
+          HOST="$(python3 -c 'import os,urllib.parse; print(urllib.parse.urlparse(os.environ["ICON_URL"]).hostname or "")')"
 
-          curl --fail --location --retry 3 \
-            --header "Authorization: Bearer $TOKEN" \
-            --header "Accept: application/octet-stream" \
+          CURL_ARGS=(--fail --location --retry 3)
+
+          if [[ "$HOST" == "github.com" || "$HOST" == "api.github.com" ]]; then
+            TOKEN="${PAT_TOKEN:-}"
+
+            if [ -z "$TOKEN" ]; then
+              echo "::error::PAT_TOKEN belum diatur."
+              exit 1
+            fi
+
+            CURL_ARGS+=(--header "Authorization: Bearer $TOKEN")
+            CURL_ARGS+=(--header "Accept: application/octet-stream")
+          fi
+
+          curl "${CURL_ARGS[@]}" \
             "$ICON_URL" \
             --output "$RUNNER_TEMP/web-icon.png"
 
@@ -226,6 +272,7 @@ jobs:
         env:
           SOURCE_URL: ${{ env.SOURCE_URL }}
           APP_NAME: ${{ env.APP_NAME }}
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -284,6 +331,7 @@ jobs:
                   release {
                       minifyEnabled false
                   }
+
                   debug {
                       debuggable true
                   }
@@ -292,16 +340,33 @@ jobs:
           EOF
 
           python3 - <<'PY'
-          import os, html
+          import os
+          import html
+          import xml.etree.ElementTree as ET
 
           name = os.environ.get("APP_NAME", "Web App")
           url = os.environ["SOURCE_URL"]
 
-          with open(os.path.join(os.environ["RUNNER_TEMP"], "web2apk/app/src/main/res/values/strings.xml"), "w") as f:
-              f.write("<resources>")
-              f.write("<string name='app_name'>" + html.escape(name) + "</string>")
-              f.write("<string name='start_url'>" + html.escape(url) + "</string>")
-              f.write("</resources>")
+          root = ET.Element("resources")
+
+          app_name = ET.SubElement(root, "string", {"name": "app_name"})
+          app_name.text = name
+
+          start_url = ET.SubElement(root, "string", {"name": "start_url"})
+          start_url.text = url
+
+          ET.indent(root)
+
+          path = os.path.join(
+              os.environ["RUNNER_TEMP"],
+              "web2apk/app/src/main/res/values/strings.xml"
+          )
+
+          ET.ElementTree(root).write(
+              path,
+              encoding="utf-8",
+              xml_declaration=True
+          )
           PY
 
           cat > "$RUNNER_TEMP/web2apk/app/src/main/AndroidManifest.xml" <<'EOF'
@@ -373,6 +438,9 @@ jobs:
 
       - name: Build Web2APK
         if: steps.config.outputs.mode == 'url'
+        env:
+          BUILD_TYPE: ${{ env.BUILD_TYPE }}
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -381,19 +449,27 @@ jobs:
 
           cd "$RUNNER_TEMP/web2apk"
 
-          curl -fL \
+          curl --fail --location \
             https://services.gradle.org/distributions/gradle-8.9-bin.zip \
-            -o "$RUNNER_TEMP/gradle.zip"
+            --output "$RUNNER_TEMP/gradle.zip"
 
           unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
 
-          "$RUNNER_TEMP/gradle-8.9/bin/gradle" \
-            --no-daemon ":app:assemble${{ env.BUILD_TYPE == 'release' && 'Release' || 'Debug' }}"
+          if [ "$BUILD_TYPE" = "release" ]; then
+            GRADLE_TASK="assembleRelease"
+          else
+            GRADLE_TASK="assembleDebug"
+          fi
 
-          APK_PATH="$RUNNER_TEMP/web2apk/app/build/outputs/apk/${{ env.BUILD_TYPE }}/app-${{ env.BUILD_TYPE }}.apk"
+          "$RUNNER_TEMP/gradle-8.9/bin/gradle" \
+            --no-daemon \
+            ":app:$GRADLE_TASK"
+
+          APK_PATH="$RUNNER_TEMP/web2apk/app/build/outputs/apk/${BUILD_TYPE}/app-${BUILD_TYPE}.apk"
 
           if [ ! -s "$APK_PATH" ]; then
             echo "::error::APK Web2APK tidak ditemukan."
+            find app/build/outputs -type f 2>/dev/null | head -100
             exit 1
           fi
 
@@ -407,3 +483,4 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
+          
